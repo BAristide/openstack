@@ -1,0 +1,15 @@
+1- 
+# wget http://download.cirros-cloud.net/0.4.0/cirros-0.4.0-x86_64-disk.img
+
+2-
+root@client01 ~(keystone)#openstack image create \
+ --disk-format qcow2 --container-format bare  \
+ --public --file cirros-0.4.0-x86_64-disk.img cirros --max-width 70
+
+3-
+$openstack image list
+
+4- #openstack network create --share \
+--provider-network-type flat \
+--provider-physical-network provider --external public01 \
+--max-width 70
