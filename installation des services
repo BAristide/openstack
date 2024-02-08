@@ -1,0 +1,708 @@
+Installation des services Openstack 
+
+1- Installation des pacquages
+
+ssh root@NODEHOSTNAME "sudo apt update &&
+sudo apt -y upgrade && sudo apt -y install software-properties-common &&
+sudo add-apt-repository cloud-archive:victoria &&
+apt install python3-openstackclient -y"
+
+2. Installation de mariadb rabbitmq-server memcached et etcd
+
+ssh root@controller01 <<EOF
+sudo apt -y install rabbitmq-server memcached python3-pymysql mariadb-server &&
+sudo rabbitmqctl add_user openstack 186164126e30c2564d33 &&
+sudo rabbitmqctl set_permissions openstack '.*' '.*' '.*' &&
+sudo sed -i 's/bind-address.*/bind-address = 0.0.0.0/' /etc/mysql/mariadb.conf.d/50-server.cnf &&
+sudo sed -i 's/#max_connections.*/max_connections = 500/' /etc/mysql/mariadb.conf.d/50-server.cnf &&
+sudo sed -i 's/-l .*/-l 0.0.0.0/' /etc/memcached.conf &&
+sudo systemctl restart mariadb rabbitmq-server memcached
+EOF
+
+3- Se connecter au le nœud controller01
+a- 
+# nano /etc/mysql/mariadb.conf.d/99-openstack.cnf
+[mysqld]
+bind-address = 0.0.0.0
+default-storage-engine = innodb
+innodb_file_per_table = on
+max_connections = 4096
+collation-server = utf8_general_ci
+character-set-server = utf8
+
+b- Redemarrer le service
+sudo systemctl restart mariadb
+
+4- ssh root@controller01 "apt-get update && apt install etcd -y"
+
+5- Configuration des fichiers puis redemarrage du service
+ssh root@controller01 <<EOF
+sudo mv /etc/default/etcd /etc/default/etcd.org &&
+sudo touch /etc/default/etcd &&
+sudo tee -a /etc/default/etcd <<EOC
+ETCD_NAME="controller"
+ETCD_DATA_DIR="/var/lib/etcd"
+ETCD_INITIAL_CLUSTER_STATE="new"
+ETCD_INITIAL_CLUSTER_TOKEN="etcd-cluster-01"
+ETCD_INITIAL_CLUSTER="controller=http://controller:2380"
+ETCD_INITIAL_ADVERTISE_PEER_URLS="http://controller:2380"
+ETCD_ADVERTISE_CLIENT_URLS="http://controller:2379"
+ETCD_LISTEN_PEER_URLS="http://0.0.0.0:2380"
+ETCD_LISTEN_CLIENT_URLS="http://0.0.0.0:2379"
+EOC
+systemctl enable etcd && systemctl restart etcd
+EOF
+
+3. Déploiement de Keystone
+
+a- 
+echo -e "create database glance;\n
+grant all privileges on glance.* to glance@'localhost' identified by '186164126e30c2564d33';\n
+grant all privileges on glance.* to glance@'%' identified by '186164126e30c2564d33'; \n
+flush privileges;" > glance.sql &&
+scp glance.sql root@controller01:/tmp/glance.sql &&
+ssh root@controller01 "sudo mysql -u root -p186164126e30c2564d33 < /tmp/glance.sql" &&
+rm glance.sql
+b-
+
+ssh root@controller01 "apt -y install keystone python3-openstackclient apache2 libapache2-mod-wsgi-py3 python3-oauth2client"
+
+c-
+
+ssh root@controller01 <<EOF
+sudo cp /etc/keystone/keystone.conf  /etc/keystone/keystone.conf.org1 &&
+sudo sed -i -e '/^\[token\]$/a provider = fernet' /etc/keystone/keystone.conf &&
+sudo sed -i -e '/^\[cache\]$/a memcache_servers = controller:11211' /etc/keystone/keystone.conf &&
+sudo sed -i '/^connection/s/^/#/' /etc/keystone/keystone.conf &&
+sudo sed -i -e '/^\[database\]$/a connection = mysql+pymysql://keystone:186164126e30c2564d33@controller/keystone' /etc/keystone/keystone.conf
+EOF
+
+d-
+
+ssh root@controller01 "sudo su -s /bin/bash keystone -c 'keystone-manage db_sync'"
+
+e-
+
+ssh root@controller01 "sudo keystone-manage fernet_setup --keystone-user keystone --keystone-group keystone &&
+sudo keystone-manage credential_setup --keystone-user keystone --keystone-group keystone"
+
+f-
+ssh root@controller01 "sudo keystone-manage bootstrap --bootstrap-password 186164126e30c2564d33 \
+--bootstrap-admin-url http://controller:5000/v3/ \
+--bootstrap-internal-url http://controller:5000/v3/ \
+--bootstrap-public-url http://controller:5000/v3/ \
+--bootstrap-region-id RegionOne"
+
+g-
+ssh root@controller01 "sudo cp /etc/apache2/apache2.conf /etc/apache2/apache2.conf.org &&
+sudo sed -i '1 i\ServerName controller'  /etc/apache2/apache2.conf &&
+sudo systemctl restart apache2"
+
+
+/!\ From deployment node
+
+$ sudo apt -y install  python3-openstackclient libapache2-mod-wsgi-py3 python3-oauth2client
+
+# vi ~/keystonerc
+export OS_PROJECT_DOMAIN_NAME=default
+export OS_USER_DOMAIN_NAME=default
+export OS_PROJECT_NAME=admin
+export OS_USERNAME=admin
+export OS_PASSWORD=186164126e30c2564d33
+export OS_AUTH_URL=http://controller:5000/v3
+export OS_IDENTITY_API_VERSION=3
+export OS_IMAGE_API_VERSION=2
+export PS1='\u@\h \W(keystone)\$'
+
+Depuis le nœud déploiement
+# openstack project create --domain default --description "Service Project" service
+
+
+
+4.	Installation du service d’image GLANCE
+
+a-
+echo -e "create database glance;\n
+grant all privileges on glance.* to glance@'localhost' identified by '186164126e30c2564d33';\n
+grant all privileges on glance.* to glance@'%' identified by '186164126e30c2564d33'; \n
+flush privileges;" > glance.sql &&
+scp glance.sql root@controller01:/tmp/glance.sql &&
+ssh root@controller01 "sudo mysql -u root -p186164126e30c2564d33 < /tmp/glance.sql" &&
+rm glance.sql
+
+b-
+openstack user create --domain default \
+--project service --password 186164126e30c2564d33 glance &&
+openstack role add --project service --user glance admin &&
+openstack service create --name glance \
+--description "OpenStack Image service" image &&
+openstack endpoint create --region RegionOne image public http://controller:9292 &&
+openstack endpoint create --region RegionOne image internal http://controller:9292 &&
+openstack endpoint create --region RegionOne image admin http://controller:9292
+
+c- 
+ssh root@controller01 "sudo apt -y install glance"
+
+d- 
+
+ssh root@controller01 <<EOF
+sudo mv /etc/glance/glance-api.conf /etc/glance/glance-api.conf.org &&
+sudo touch /etc/glance/glance-api.conf &&
+sudo tee /etc/glance/glance-api.conf <<EOC
+[DEFAULT]
+bind_host = 0.0.0.0
+
+[glance_store]
+stores = file,http
+default_store = file
+filesystem_store_datadir = /var/lib/glance/images/
+
+[database]
+connection = mysql+pymysql://glance:186164126e30c2564d33@controller/glance
+
+[keystone_authtoken]
+www_authenticate_uri = http://controller:5000
+auth_url = http://controller:5000
+memcached_servers = controller:11211
+auth_type = password
+project_domain_name = default
+user_domain_name = default
+project_name = service
+username = glance
+password = 186164126e30c2564d33
+
+[paste_deploy]
+flavor = keystone
+EOC
+sudo chmod 640 /etc/glance/glance-api.conf &&
+sudo chown root:glance /etc/glance/glance-api.conf &&
+sudo su -s /bin/bash glance -c 'glance-manage db_sync' &&
+sudo systemctl restart glance-api &&
+sudo systemctl enable glance-api
+EOF
+
+e-Add image 
+
+# wget http://download.cirros-cloud.net/0.4.0/cirros-0.4.0-x86_64-disk.img
+
+openstack image create \
+--disk-format qcow2 --container-format bare  \
+--public --file cirros-0.4.0-x86_64-disk.img cirros --max-width 70
+
+
+5.	Configuration de Nova et placement sur le controller01
+
+a- 
+
+openstack user create --domain default --project service --password 186164126e30c2564d33 nova &&
+openstack role add --project service --user nova admin &&
+openstack user create --domain default --project service --password 186164126e30c2564d33 placement &&
+openstack role add --project service --user placement admin &&
+openstack service create --name nova compute &&
+openstack service create --name placement placement
+
+
+b-
+openstack endpoint create --region RegionOne compute public http://controller:8774/v2.1 &&
+openstack endpoint create --region RegionOne compute internal http://controller:8774/v2.1 &&
+openstack endpoint create --region RegionOne compute admin http://controller:8774/v2.1 &&
+openstack endpoint create --region RegionOne placement public http://controller:8778 &&
+openstack endpoint create --region RegionOne placement internal http://controller:8778 &&
+openstack endpoint create --region RegionOne placement admin http://controller:8778
+
+c-
+echo -e "create database nova;\n
+grant all privileges on nova.* to nova@localhost identified by '186164126e30c2564d33';\n
+grant all privileges on nova.* to nova@'%' identified by '186164126e30c2564d33';\n
+create database nova_api;\n
+grant all privileges on nova_api.* to nova@localhost identified by '186164126e30c2564d33';\n
+grant all privileges on nova_api.* to nova@'%' identified by '186164126e30c2564d33';\n
+create database placement;\n
+grant all privileges on placement.* to placement@localhost identified by '186164126e30c2564d33';\n
+grant all privileges on placement.* to placement@'%' identified by '186164126e30c2564d33';\n
+create database nova_cell0;\n
+grant all privileges on nova_cell0.* to nova@localhost identified by '186164126e30c2564d33';\n
+grant all privileges on nova_cell0.* to nova@'%' identified by '186164126e30c2564d33';\n
+flush privileges;" > compueplance.sql &&
+scp compueplance.sql root@controller01:/tmp/compueplance.sql &&
+ssh root@controller01 "sudo mysql -u root -p186164126e30c2564d33 < /tmp/compueplance.sql" &&
+rm compueplance.sql
+
+d-
+
+ssh root@controller01 <<EOF 
+sudo apt -y install nova-api nova-conductor nova-scheduler nova-novncproxy placement-api python3-novaclient &&
+sudo mv /etc/nova/nova.conf /etc/nova/nova.conf.org &&
+sudo touch /etc/nova/nova.conf &&
+sudo tee /etc/nova/nova.conf <<EOC
+[DEFAULT]
+my_ip = controller
+state_path = /var/lib/nova
+enabled_apis = osapi_compute,metadata
+log_dir = /var/log/nova
+transport_url = rabbit://openstack:186164126e30c2564d33@controller
+
+[api]
+auth_strategy = keystone
+
+[glance]
+api_servers = http://controller:9292
+
+[oslo_concurrency]
+lock_path = /var/lib/nova/tmp
+
+[api_database]
+connection = mysql+pymysql://nova:186164126e30c2564d33@controller/nova_api
+
+[database]
+connection = mysql+pymysql://nova:186164126e30c2564d33@controller/nova
+
+[keystone_authtoken]
+www_authenticate_uri = http://controller:5000
+auth_url = http://controller:5000
+memcached_servers = controller:11211
+auth_type = password
+project_domain_name = default
+user_domain_name = default
+project_name = service
+username = nova
+password = 186164126e30c2564d33
+
+[placement]
+auth_url = http://controller:5000
+os_region_name = RegionOne
+auth_type = password
+project_domain_name = default
+user_domain_name = default
+project_name = service
+username = placement
+password = 186164126e30c2564d33
+
+[wsgi]
+api_paste_config = /etc/nova/api-paste.ini
+EOC
+sudo chmod 640 /etc/nova/nova.conf &&
+sudo chgrp nova /etc/nova/nova.conf &&
+sudo mv /etc/placement/placement.conf /etc/placement/placement.conf.org &&
+sudo touch /etc/placement/placement.conf &&
+sudo tee /etc/placement/placement.conf <<EOC
+[DEFAULT]
+debug = false
+
+[api]
+auth_strategy = keystone
+
+[keystone_authtoken]
+www_authenticate_uri = http://controller:5000
+auth_url = http://controller:5000
+memcached_servers = controller:11211
+auth_type = password
+project_domain_name = default
+user_domain_name = default
+project_name = service
+username = placement
+password = 186164126e30c2564d33
+
+[placement_database]
+connection = mysql+pymysql://placement:186164126e30c2564d33@controller/placement
+EOC
+sudo chmod 640 /etc/placement/placement.conf &&
+sudo chgrp placement /etc/placement/placement.conf &&
+sudo su -s /bin/bash placement -c 'placement-manage db sync' &&
+sudo su -s /bin/bash nova -c 'nova-manage api_db sync' &&
+sudo su -s /bin/bash nova -c 'nova-manage cell_v2 map_cell0' &&
+sudo su -s /bin/bash nova -c 'nova-manage db sync' &&
+sudo su -s /bin/bash nova -c 'nova-manage cell_v2 create_cell --name cell1' &&
+sudo systemctl restart apache2 &&
+sudo systemctl restart nova-api nova-conductor nova-scheduler nova-novncproxy &&
+sudo systemctl enable nova-api nova-conductor nova-scheduler nova-novncproxy
+EOF
+
+e-
+# openstack compute service list
+---------------------------------------------------------------------------------------
+6.	Configuration de Nova sur le Compute Node 01
+---------------------------------------------------------------------------------------
+a-
+ssh root@compute01 "sudo apt install nova-compute -y"
+
+b- /!\ Remplacer IP_NODE_COMPUTE01 par l’IP de votre compute node01
+
+ssh root@compute01 <<EOF
+sudo mv /etc/nova/nova.conf /etc/nova/nova.conf.org &&
+sudo touch /etc/nova/nova.conf &&
+sudo tee /etc/nova/nova.conf <<EOC
+[DEFAULT]
+transport_url = rabbit://openstack:186164126e30c2564d33@controller
+my_ip = IP_NODE_COMPUTE01
+log_dir = /var/log/nova
+lock_path = /var/lock/nova
+state_path = /var/lib/nova
+[api]
+auth_strategy = keystone
+
+[keystone_authtoken]
+www_authenticate_uri = http://controller:5000/
+auth_url = http://controller:5000/
+memcached_servers = controller:11211
+auth_type = password
+project_domain_name = Default
+user_domain_name = Default
+project_name = service
+username = nova
+password = 186164126e30c2564d33
+
+[vnc]
+enabled = true
+server_listen = 0.0.0.0
+server_proxyclient_address = IP_NODE_COMPUTE01
+novncproxy_base_url = http://controller:6080/vnc_auto.html
+
+[glance]
+api_servers = http://controller:9292
+[oslo_concurrency]
+lock_path = /var/lib/nova/tmp
+
+[placement]
+region_name = RegionOne
+project_domain_name = Default
+project_name = service
+auth_type = password
+user_domain_name = Default
+auth_url = http://controller:5000/v3
+username = placement
+password = 186164126e30c2564d33
+[wsgi]
+api_paste_config = /etc/nova/api-paste.ini
+EOC
+sudo chmod 640 /etc/nova/nova.conf && sudo chgrp nova /etc/nova/nova.conf &&
+sudo sed -i 's/virt_type.*/virt_type = qemu/' /etc/nova/nova-compute.conf  &&
+sudo service nova-compute restart
+EOF
+
+c- 
+
+ssh root@controller01 <<EOF
+sudo su -s /bin/sh -c "nova-manage cell_v2 discover_hosts --verbose" nova
+EOF
+
+d-
+
+#openstack compute service list
+
+--------------------------------------------------------------------------------------------------------
+7.	Configuration du service réseau avec Neutron sur Controller01
+--------------------------------------------------------------------------------------------------------
+a-
+echo -e "create database neutron;\n
+grant all privileges on neutron.* to neutron@'localhost' identified by '186164126e30c2564d33';\n
+grant all privileges on neutron.* to neutron@'%' identified by '186164126e30c2564d33';\n
+flush privileges;" > neutron.sql &&
+scp neutron.sql root@controller01:/tmp/neutron.sql &&
+ssh root@controller01 "sudo mysql -u root -p186164126e30c2564d33 < /tmp/neutron.sql" &&
+rm neutron.sql 
+
+b-
+openstack user create --domain default \
+--project service --password 186164126e30c2564d33 neutron &&
+openstack role add --project service --user neutron admin &&
+openstack service create --name neutron network &&
+openstack endpoint create --region RegionOne network public http://controller:9696 &&
+openstack endpoint create --region RegionOne network internal http://controller:9696 &&
+openstack endpoint create --region RegionOne network admin http://controller:9696
+
+c-
+ssh root@controller01 "sudo apt -y install neutron-server neutron-metadata-agent &&
+sudo apt -y install neutron-plugin-ml2 python3-neutronclient"
+
+d-
+
+ssh root@controller01 <<EOF
+sudo mv /etc/neutron/neutron.conf /etc/neutron/neutron.conf.org &&
+sudo touch /etc/neutron/neutron.conf &&
+sudo tee /etc/neutron/neutron.conf <<EOC
+[DEFAULT]
+core_plugin = ml2
+service_plugins = router
+auth_strategy = keystone
+state_path = /var/lib/neutron
+dhcp_agent_notification = True
+allow_overlapping_ips = True
+notify_nova_on_port_status_changes = True
+notify_nova_on_port_data_changes = True
+transport_url = rabbit://openstack:186164126e30c2564d33@controller
+
+[agent]
+root_helper = sudo /usr/bin/neutron-rootwrap /etc/neutron/rootwrap.conf
+
+[keystone_authtoken]
+www_authenticate_uri = http://controller:5000
+auth_url = http://controller:5000
+memcached_servers = controller:11211
+auth_type = password
+project_domain_name = default
+user_domain_name = default
+project_name = service
+username = neutron
+password = 186164126e30c2564d33
+
+[database]
+connection = mysql+pymysql://neutron:186164126e30c2564d33@controller/neutron
+
+[nova]
+auth_url = http://controller:5000
+auth_type = password
+project_domain_name = default
+user_domain_name = default
+region_name = RegionOne
+project_name = service
+username = nova
+password = 186164126e30c2564d33
+
+[oslo_concurrency]
+lock_path = /var/lib/neutron/tmp
+EOC
+sudo chmod 640 /etc/neutron/neutron.conf &&
+sudo chgrp neutron /etc/neutron/neutron.conf &&
+sudo cp /etc/neutron/metadata_agent.ini /etc/neutron/metadata_agent.ini.org &&
+sudo sed -i -e '/^\[DEFAULT\]$/a nova_metadata_host = controller' /etc/neutron/metadata_agent.ini &&
+sudo sed -i -e '/^\[DEFAULT\]$/a metadata_proxy_shared_secret = 186164126e30c2564d33' /etc/neutron/metadata_agent.ini &&
+sudo cp /etc/neutron/plugins/ml2/ml2_conf.ini /etc/neutron/plugins/ml2/ml2_conf.ini.org02 &&
+sudo sed -i -e '/^\[ml2\]$/a type_drivers = flat,vlan,vxlan' /etc/neutron/plugins/ml2/ml2_conf.ini &&
+sudo sed -i -e '/^\[ml2\]$/a tenant_network_types = vxlan' /etc/neutron/plugins/ml2/ml2_conf.ini &&
+sudo sed -i -e '/^\[ml2\]$/a mechanism_drivers = openvswitch,l2population' /etc/neutron/plugins/ml2/ml2_conf.ini &&
+sudo sed -i -e '/^\[ml2\]$/a extension_drivers = port_security' /etc/neutron/plugins/ml2/ml2_conf.ini &&
+sudo sed -i -e '/^\[ml2_type_vxlan\]$/a vni_ranges = 1:1000' /etc/neutron/plugins/ml2/ml2_conf.ini &&
+sudo sed -i -e '/^\[securitygroup\]$/a enable_ipset = True' /etc/neutron/plugins/ml2/ml2_conf.ini &&
+sudo cp /etc/nova/nova.conf /etc/nova/nova.conf.03092023
+sudo tee -a /etc/nova/nova.conf <<EOC
+[neutron]
+auth_url = http://controller:5000
+auth_type = password
+project_domain_name = default
+user_domain_name = default
+region_name = RegionOne
+project_name = service
+username = neutron
+password = 186164126e30c2564d33
+service_metadata_proxy = True
+metadata_proxy_shared_secret = 186164126e30c2564d33
+EOC
+sudo ln -s /etc/neutron/plugins/ml2/ml2_conf.ini /etc/neutron/plugin.ini &&
+sudo su -s /bin/bash neutron -c 'neutron-db-manage --config-file /etc/neutron/neutron.conf --config-file /etc/neutron/plugin.ini upgrade head' &&
+service nova-api restart &&
+service neutron-server restart
+EOF
+
+
+------------------------------------------------------------------------------------
+8.	Configuration de Neutron sur Network01
+------------------------------------------------------------------------------------
+
+a-
+ssh root@network01 "sudo apt -y install neutron-plugin-ml2 neutron-openvswitch-agent &&
+sudo apt -y install neutron-l3-agent python3-neutronclient"
+
+b-
+
+/!\ NB: Veuillez remplacer IP_NETWORKNODE01 par l’IP de votre network node
+
+ssh root@network01 <<EOF
+sudo mv /etc/neutron/neutron.conf /etc/neutron/neutron.conf.org &&
+sudo touch /etc/neutron/neutron.conf && 
+sudo tee /etc/neutron/neutron.conf <<EOC
+[DEFAULT]
+core_plugin = ml2
+service_plugins = router
+auth_strategy = keystone
+state_path = /var/lib/neutron
+allow_overlapping_ips = True
+transport_url = rabbit://openstack:186164126e30c2564d33@controller
+
+[agent]
+root_helper = sudo /usr/bin/neutron-rootwrap /etc/neutron/rootwrap.conf
+
+[keystone_authtoken]
+www_authenticate_uri = http://controller:5000
+auth_url = http://controller:5000
+memcached_servers = controller:11211
+auth_type = password
+project_domain_name = default
+user_domain_name = default
+project_name = service
+username = neutron
+password = 186164126e30c2564d33
+
+[oslo_concurrency]
+lock_path = /var/lib/neutron/lock
+EOC
+sudo touch /etc/neutron/fwaas_driver.ini &&
+sudo chmod 640 /etc/neutron/{neutron.conf,fwaas_driver.ini} &&
+sudo chgrp neutron /etc/neutron/{neutron.conf,fwaas_driver.ini} &&
+sudo cp /etc/neutron/l3_agent.ini /etc/neutron/l3_agent.ini.org &&
+sudo sed -i -e '/^\[DEFAULT\]$/a interface_driver = openvswitch' /etc/neutron/l3_agent.ini &&
+sudo sed -i -e '/^\[DEFAULT\]$/a external_network_bridge = br-provider' /etc/neutron/l3_agent.ini && 
+sudo cp /etc/neutron/plugins/ml2/ml2_conf.ini /etc/neutron/plugins/ml2/ml2_conf.ini.org01 &&
+sudo sed -i -e '/^\[ml2\]$/a type_drivers = flat,vlan,vxlan' /etc/neutron/plugins/ml2/ml2_conf.ini &&
+sudo sed -i -e '/^\[ml2\]$/a mechanism_drivers = openvswitch' /etc/neutron/plugins/ml2/ml2_conf.ini &&
+sudo sed -i -e '/^\[ml2\]$/a extension_drivers = port_security' /etc/neutron/plugins/ml2/ml2_conf.ini &&
+sudo cp /etc/neutron/plugins/ml2/openvswitch_agent.ini /etc/neutron/plugins/ml2/openvswitch_agent.ini.org01 &&
+sudo sed -i -e '/^\[ovs\]$/a bridge_mappings = provider:br-provider' /etc/neutron/plugins/ml2/openvswitch_agent.ini &&
+sudo sed -i -e '/^\[ovs\]$/a tunnel_bridge = br-tun' /etc/neutron/plugins/ml2/openvswitch_agent.ini &&
+sudo sed -i -e '/^\[ovs\]$/a local_ip = IP_NETWORKNODE01' /etc/neutron/plugins/ml2/openvswitch_agent.ini &&
+sudo sed -i -e '/^\[agent\]$/a tunnel_types = vxlan' /etc/neutron/plugins/ml2/openvswitch_agent.ini &&
+sudo sed -i -e '/^\[agent\]$/a l2_population = true' /etc/neutron/plugins/ml2/openvswitch_agent.ini &&
+sudo sed -i -e '/^\[agent\]$/a ovsdb_monitor_respawn_interval = 30' /etc/neutron/plugins/ml2/openvswitch_agent.ini &&
+sudo sed -i -e '/^\[securitygroup\]$/a firewall_driver = openvswitch' /etc/neutron/plugins/ml2/openvswitch_agent.ini &&
+sudo sed -i -e '/^\[securitygroup\]$/a enable_security_group = true' /etc/neutron/plugins/ml2/openvswitch_agent.ini &&
+sudo sed -i -e '/^\[securitygroup\]$/a enable_ipset = true' /etc/neutron/plugins/ml2/openvswitch_agent.ini &&
+sudo ln -s /etc/neutron/plugins/ml2/ml2_conf.ini /etc/neutron/plugin.ini &&
+sudo ovs-vsctl add-br br-provider &&
+sudo ovs-vsctl add-port br-provider ens4 &&
+sudo tee /etc/sysctl.d/kubernetes.conf<<EOC
+net.bridge.bridge-nf-call-ip6tables = 1
+net.bridge.bridge-nf-call-iptables = 1
+net.ipv4.ip_forward = 1
+EOC
+sudo systemctl restart neutron-l3-agent neutron-openvswitch-agent &&
+sudo systemctl enable neutron-l3-agent neutron-openvswitch-agent
+EOF
+
+
+
+----------------------------------------------------------------------------------------------------------------------------
+9.	Configuration du réseau sur le nœud compute01
+----------------------------------------------------------------------------------------------------------------------------
+
+
+a-
+ssh root@compute01 "sudo virsh net-destroy default && sudo virsh net-autostart --network default --disable"
+b-
+ssh root@compute01 "sudo apt -y install neutron-openvswitch-agent && sudo apt -y install neutron-dhcp-agent neutron-metadata-agent"
+
+c-
+
+NB: Veuillez remplacer IP_COMPUTENODE01 par l’IP de votre network node
+
+
+ssh root@compute01 <<EOF
+sudo mv /etc/neutron/neutron.conf /etc/neutron/neutron.conf.org &&
+sudo touch /etc/neutron/neutron.conf &&
+sudo tee /etc/neutron/neutron.conf <<EOC
+[DEFAULT]
+core_plugin = ml2
+auth_strategy = keystone
+state_path = /var/lib/neutron
+transport_url = rabbit://openstack:186164126e30c2564d33@controller
+
+[agent]
+root_helper = sudo /usr/bin/neutron-rootwrap /etc/neutron/rootwrap.conf
+
+[keystone_authtoken]
+www_authenticate_uri = http://controller:5000
+auth_url = http://controller:5000
+memcached_servers = controller:11211
+auth_type = password
+project_domain_name = default
+user_domain_name = default
+project_name = service
+username = neutron
+password = 186164126e30c2564d33
+
+[oslo_concurrency]
+lock_path = /var/lib/neutron/tmp
+EOC
+sudo chmod 640 /etc/neutron/neutron.conf &&
+sudo chgrp neutron /etc/neutron/neutron.conf &&
+sudo cp /etc/neutron/plugins/ml2/ml2_conf.ini /etc/neutron/plugins/ml2/ml2_conf.ini.org01 &&
+sudo sed -i -e '/^\[ml2\]$/a type_drivers = flat,vlan,vxlan' /etc/neutron/plugins/ml2/ml2_conf.ini &&
+sudo sed -i -e '/^\[ml2\]$/a mechanism_drivers = openvswitch' /etc/neutron/plugins/ml2/ml2_conf.ini &&
+sudo sed -i -e '/^\[ml2\]$/a tenant_network_types =' /etc/neutron/plugins/ml2/ml2_conf.ini &&
+sudo sed -i -e '/^\[ml2\]$/a extension_drivers = port_security' /etc/neutron/plugins/ml2/ml2_conf.ini &&
+sudo sed -i -e '/^\[ml2_type_flat\]$/a flat_networks = provider' /etc/neutron/plugins/ml2/ml2_conf.ini &&
+sudo cp /etc/neutron/plugins/ml2/openvswitch_agent.ini /etc/neutron/plugins/ml2/openvswitch_agent.ini.org &&
+sudo sed -i -e '/^\[agent\]$/a tunnel_types = vxlan' /etc/neutron/plugins/ml2/openvswitch_agent.ini &&
+sudo sed -i -e '/^\[agent\]$/a l2_population = True' /etc/neutron/plugins/ml2/openvswitch_agent.ini &&
+sudo sed -i -e '/^\[securitygroup\]$/a enable_security_group = true' /etc/neutron/plugins/ml2/openvswitch_agent.ini &&
+sudo sed -i -e '/^\[securitygroup\]$/a firewall_driver = openvswitch' /etc/neutron/plugins/ml2/openvswitch_agent.ini &&
+sudo sed -i -e '/^\[securitygroup\]$/a enable_ipset = true' /etc/neutron/plugins/ml2/openvswitch_agent.ini &&
+sudo sed -i -e '/^\[ovs\]$/a local_ip = IP_COMPUTENODE01 ' /etc/neutron/plugins/ml2/openvswitch_agent.ini &&
+sudo sed -i -e '/^\[ovs\]$/a bridge_mappings = provider:br-provider' /etc/neutron/plugins/ml2/openvswitch_agent.ini &&
+sudo sed -i -e '/^\[ovs\]$/a tunnel_bridge = br-tun' /etc/neutron/plugins/ml2/openvswitch_agent.ini &&
+sudo cp /etc/nova/nova.conf /etc/nova/nova.conf.org09 &&
+sudo sed -i -e '/^\[DEFAULT\]$/a vif_plugging_is_fatal = True' /etc/nova/nova.conf &&
+sudo sed -i -e '/^\[DEFAULT\]$/a vif_plugging_timeout = 300' /etc/nova/nova.conf &&
+sudo sed -i -e '/^\[DEFAULT\]$/a nova_metadata_host = controller' /etc/neutron/metadata_agent.ini &&
+sudo sed -i -e '/^\[DEFAULT\]$/a memcache_servers = controller:11211' /etc/neutron/metadata_agent.ini &&
+sudo sed -i -e '/^\[DEFAULT\]$/a metadata_proxy_shared_secret = 186164126e30c2564d33' /etc/neutron/metadata_agent.ini &&
+sudo cp /etc/neutron/dhcp_agent.ini /etc/neutron/dhcp_agent.ini.org &&
+sudo sed -i -e '/^\[DEFAULT\]$/a interface_driver = openvswitch' /etc/neutron/dhcp_agent.ini && 
+sudo sed -i -e '/^\[DEFAULT\]$/a dhcp_driver = neutron.agent.linux.dhcp.Dnsmasq' /etc/neutron/dhcp_agent.ini && 
+sudo sed -i -e '/^\[DEFAULT\]$/a enable_isolated_metadata = true' /etc/neutron/dhcp_agent.ini &&
+sudo sed -i -e '/^\[DEFAULT\]$/a force_metadata = True' /etc/neutron/dhcp_agent.ini &&
+sudo sed -i -e '/^\[DEFAULT\]$/a enable_metadata_network = True' /etc/neutron/dhcp_agent.ini &&
+sudo tee -a /etc/nova/nova.conf <<EOC
+[neutron]
+url = http://controller:9696
+auth_url = http://controller:5000
+auth_type = password
+project_domain_name = default
+user_domain_name = default
+region_name = RegionOne
+project_name = service
+username = neutron
+password = 186164126e30c2564d33
+service_metadata_proxy = True
+metadata_proxy_shared_secret = 186164126e30c2564d33
+EOC
+sudo ovs-vsctl add-br br-provider &&
+sudo ovs-vsctl add-port br-provider ens4 &&
+sudo tee /etc/sysctl.d/kubernetes.conf <<EOC
+net.bridge.bridge-nf-call-ip6tables = 1
+net.bridge.bridge-nf-call-iptables = 1
+net.ipv4.ip_forward = 1
+EOC
+sudo  systemctl restart nova-compute &&
+sudo systemctl restart neutron-dhcp-agent neutron-metadata-agent neutron-openvswitch-agent &&
+sudo systemctl enable neutron-dhcp-agent neutron-metadata-agent neutron-openvswitch-agent
+EOF
+
+
+-----------------------------------------------------------------------------
+10.	Configuration d’Horizon sur controller01
+------------------------------------------------------------------------------
+
+a- ssh root@controller01 "sudo apt -y install openstack-dashboard"
+
+c-
+Allez sur le neoud controller01 et modifier les fichiers comme suit :
+
+# vi /etc/openstack-dashboard/local_settings.py +99
+# line 99 : change Memcache server
+CACHES = {
+    'default': {
+        'BACKEND': 'django.core.cache.backends.memcached.MemcachedCache',
+        'LOCATION': 'MANAGEMENT_IP:11211',
+    },
+}
+
+SESSION_ENGINE = "django.contrib.sessions.backends.cache"
+
+OPENSTACK_HOST = "MANAGEMENT_VIP_IP"
+#OPENSTACK_KEYSTONE_URL = "http://%s/identity/v3" % OPENSTACK_HOST
+OPENSTACK_KEYSTONE_URL = "http://MANAGEMENT_IP:5000/v3"
+
+TIME_ZONE = "Africa/Abidjan"
+# add to the end
+OPENSTACK_KEYSTONE_MULTIDOMAIN_SUPPORT = True
+OPENSTACK_KEYSTONE_DEFAULT_DOMAIN = 'Default'
+
+Redemarrer apache2
+
+systemctl restart apache2
+
+Dans le navigateur lancer l’url dans le navigateur.
+http://MANAGEMENT_IP/horizon/
+
+
+
