@@ -21,6 +21,24 @@ EOF
 
 3- Se connecter au le nœud controller01
 a- 
+
+ssh root@controller01 <<EOF 
+sudo touch /etc/mysql/mariadb.conf.d/99-openstack.cnf &&
+sudo tee /etc/mysql/mariadb.conf.d/99-openstack.cnf <<EOC
+[mysqld]
+bind-address = 0.0.0.0
+
+default-storage-engine = innodb
+innodb_file_per_table = on
+max_connections = 4096
+collation-server = utf8_general_ci
+character-set-server = utf8
+EOC
+sudo systemctl restart mariadb &&
+sudo systemctl enable mariadb
+EOF
+
+
 # nano /etc/mysql/mariadb.conf.d/99-openstack.cnf
 [mysqld]
 bind-address = 0.0.0.0
